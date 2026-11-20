@@ -1,0 +1,8 @@
+/target
+/models
+/nf_frames
+/research
+/smoke.wav
+*.log
+.claude
+.DS_Store

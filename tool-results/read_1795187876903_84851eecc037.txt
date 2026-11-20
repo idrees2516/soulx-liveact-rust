@@ -1,0 +1,946 @@
+     1→import os
+     2→import argparse
+     3→import threading
+     4→import time
+     5→import socket
+     6→import subprocess
+     7→import shutil
+     8→import json
+     9→import gc
+    10→import datetime
+    11→import torch
+    12→import torch.distributed as dist
+    13→import torchaudio
+    14→import torchaudio.transforms as T
+    15→from torchvision import transforms
+    16→from PIL import Image
+    17→from flask import Flask, render_template_string, send_from_directory, jsonify, request, render_template
+    18→
+    19→from lightx2v.models.video_encoders.hf.wan.vae import WanVAE as LightVAE
+    20→from util_liveact import center_rescale_crop_keep_ratio, get_embedding, get_msk, get_audio_emb
+    21→from wan.modules.clip import CLIPModel
+    22→from wan.modules.t5 import T5EncoderModel
+    23→from src.audio_analysis.wav2vec2 import Wav2Vec2Model
+    24→from transformers import Wav2Vec2FeatureExtractor
+    25→from fp8_gemm import FP8GemmOptions, enable_fp8_gemm
+    26→import queue
+    27→from datetime import timedelta
+    28→import errno
+    29→
+    30→# ================= 1. 全局环境与配置 =================
+    31→
+    32→gc.collect()
+    33→torch.cuda.empty_cache()
+    34→torch.backends.cudnn.benchmark = True
+    35→torch.backends.cuda.matmul.allow_tf32 = True
+    36→torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+    37→torch.backends.cudnn.allow_tf32 = True
+    38→
+    39→app = Flask(__name__)
+    40→BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    41→UPLOAD_ROOT = os.path.join(BASE_DIR, "uploads")
+    42→HLS_ROOT = os.path.join(BASE_DIR, "hls_output")
+    43→M3U8_NAME = "live.m3u8"
+    44→task_queue = queue.Queue()
+    45→
+    46→os.makedirs(UPLOAD_ROOT, exist_ok=True)
+    47→os.makedirs(HLS_ROOT, exist_ok=True)
+    48→
+    49→# 状态变量
+    50→streaming_active = False
+    51→task_status_map = {}
+    52→task_status_lock = threading.Lock()
+    53→
+    54→
+    55→# ================= 2. 辅助工具函数 =================
+    56→
+    57→def get_local_ip():
+    58→    try:
+    59→        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    60→        s.connect(('8.8.8.8', 80))
+    61→        ip = s.getsockname()[0]
+    62→        s.close()
+    63→        return ip
+    64→    except Exception:
+    65→        return "127.0.0.1"
+    66→
+    67→
+    68→def resample_audio(audio, sr, fps):
+    69→    rate = 25 / fps
+    70→    y, sr_out = torchaudio.sox_effects.apply_effects_tensor(audio, sr, [["tempo", f"{rate}"]])
+    71→    resampler = T.Resample(sr_out, 16000).to(audio.device)
+    72→    return resampler(y) * 3.0, 16000
+    73→
+    74→
+    75→def update_task_status(task_id, **kwargs):
+    76→    with task_status_lock:
+    77→        if task_id not in task_status_map:
+    78→            task_status_map[task_id] = {}
+    79→        task_status_map[task_id].update(kwargs)
+    80→        task_status_map[task_id]["updated_at"] = time.time()
+    81→
+    82→
+    83→def get_task_status(task_id):
+    84→    with task_status_lock:
+    85→        data = task_status_map.get(task_id)
+    86→        return dict(data) if data is not None else None
+    87→
+    88→
+    89→# ================= 3. 分布式推理引擎类 =================
+    90→
+    91→class DistributedVideoEngine:
+    92→    def __init__(self, args):
+    93→        self.args = args
+    94→        self.rank = int(os.getenv("RANK", 0))
+    95→        self.world_size = int(os.getenv("WORLD_SIZE", 1))
+    96→        self.local_rank = int(os.getenv("LOCAL_RANK", 0))
+    97→        self.device = self.local_rank
+    98→        self.width, self.height = [int(x) for x in args.size.split('*')]
+    99→        self.use_dist = self.world_size > 1
+   100→
+   101→        self.video_save_root = os.path.abspath(getattr(args, "video_save_path", "./generated_videos"))
+   102→        os.makedirs(self.video_save_root, exist_ok=True)
+   103→
+   104→        if not dist.is_initialized() and self.world_size>1:
+   105→            torch.cuda.set_device(self.device)
+   106→            dist.init_process_group(backend="nccl", init_method="env://", rank=self.rank, world_size=self.world_size)
+   107→
+   108→        # 多卡时触发：发送python消息，防止长时间不操作，nccl超时异常
+   109→        self.control_pg = dist.new_group(backend="gloo") if self.use_dist else None
+   110→
+   111→        if self.world_size>1:
+   112→            from xfuser.core.distributed import init_distributed_environment, initialize_model_parallel
+   113→            init_distributed_environment(rank=self.rank, world_size=self.world_size)
+   114→            initialize_model_parallel(sequence_parallel_degree=self.world_size, ring_degree=1,
+   115→                                      ulysses_degree=self.world_size)
+   116→
+   117→        # 加载核心生成模型 (Wan2.1)
+   118→        if self.world_size>1:
+   119→            from model_liveact.model_memory_sp import WanModel
+   120→        else:
+   121→            from model_liveact.model_memory import WanModel
+   122→        self.wan_i2v_model = WanModel.from_pretrained(args.ckpt_dir, torch_dtype=torch.bfloat16,
+   123→                                                      low_cpu_mem_usage=False)
+   124→        self.wan_i2v_model = self.wan_i2v_model.to(dtype=torch.bfloat16)
+   125→
+   126→        enable_fp8_gemm(self.wan_i2v_model, options=FP8GemmOptions())
+   127→        if args.block_offload:
+   128→            for name, child in self.wan_i2v_model.named_children():
+   129→                if name != 'blocks':
+   130→                    child.to(self.device)
+   131→            self.wan_i2v_model.enable_block_offload(
+   132→                onload_device=torch.device(f"cuda:{self.device}"),
+   133→            )
+   134→        else:
+   135→            self.wan_i2v_model = self.wan_i2v_model.to(self.device)
+   136→        self.wan_i2v_model.freqs = self.wan_i2v_model.freqs.to(self.device)
+   137→        self.wan_i2v_model.eval()
+   138→        self.wan_i2v_model = torch.compile(self.wan_i2v_model, mode="max-autotune-no-cudagraphs", backend="inductor", dynamic=False)
+   139→
+   140→        # 采样参数
+   141→        self.vae_stride = (4, 8, 8)
+   142→        self.patch_size = (1, 2, 2)
+   143→        self.timesteps = [torch.tensor([_]).to(self.device, dtype=torch.float32) for _ in
+   144→                          [1000.0, 937.5, 833.33333333, 0.0]]
+   145→
+   146→        # 加载辅件 (VAE / CLIP / T5 / Audio)
+   147→        self.transform = transforms.Compose([
+   148→            transforms.Lambda(lambda pil_image: center_rescale_crop_keep_ratio(pil_image, (self.height, self.width))),
+   149→            transforms.ToTensor(),
+   150→            transforms.Resize((self.height, self.width)),
+   151→            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])])
+   152→        self.vae = LightVAE(vae_path=os.path.join(args.ckpt_dir, 'Wan2.1_VAE.pth'), dtype=torch.bfloat16,
+   153→                            device=self.device,
+   154→                            use_lightvae=False, parallel=(self.world_size > 1))
+   155→
+   156→        self.clip = CLIPModel(
+   157→            checkpoint_path=os.path.join(args.ckpt_dir, 'models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth'),
+   158→            tokenizer_path=os.path.join(args.ckpt_dir, 'xlm-roberta-large'), dtype=torch.bfloat16, device=self.device)
+   159→
+   160→        self.text_encoder = T5EncoderModel(text_len=512, dtype=torch.bfloat16,
+   161→                                           device='cpu' if args.t5_cpu else self.device,
+   162→                                           checkpoint_path=os.path.join(args.ckpt_dir,
+   163→                                                                        'models_t5_umt5-xxl-enc-bf16.pth'),
+   164→                                           tokenizer_path=os.path.join(args.ckpt_dir, 'google/umt5-xxl'))
+   165→
+   166→        self.audio_encoder = Wav2Vec2Model.from_pretrained(
+   167→            args.wav2vec_dir, local_files_only=True, torch_dtype=torch.bfloat16
+   168→        ).to(self.device, dtype=torch.bfloat16).eval()
+   169→        self.wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(args.wav2vec_dir,
+   170→                                                                                  local_files_only=True)
+   171→
+   172→        torch.cuda.empty_cache()
+   173→        # 初始化KV Cache
+   174→        self.blksz_lst = [6, 8]
+   175→        self.frame_len = (self.height // (self.patch_size[1] * self.vae_stride[1])) * (
+   176→                    self.width // (self.patch_size[2] * self.vae_stride[2]))
+   177→        kv_cache_tokens = self.frame_len * sum(self.blksz_lst) // self.world_size
+   178→        kv_cache_device = self.device
+   179→        kv_cache_dtype = torch.float8_e4m3fn if args.fp8_kv_cache else torch.bfloat16
+   180→        kv_scale_shape = (1, kv_cache_tokens, 40, 1)
+   181→        self.kv_cache  = \
+   182→            {
+   183→                i: {
+   184→                    layer_id: {
+   185→                        'k': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+   186→                        'v': torch.zeros([1, kv_cache_tokens, 40, 128], dtype=kv_cache_dtype, device=kv_cache_device),
+   187→                        'k_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
+   188→                                              device=kv_cache_device) if args.fp8_kv_cache else None,
+   189→                        'v_scale': torch.ones(kv_scale_shape, dtype=torch.float32,
+   190→                                              device=kv_cache_device) if args.fp8_kv_cache else None,
+   191→                        'mean_memory': False,
+   192→                        'offload_cache': False,
+   193→                        'fp8_kv_cache': args.fp8_kv_cache,
+   194→                    }
+   195→                    for layer_id in range(40)
+   196→                } for i in range(len(self.timesteps) - 1)
+   197→            }
+   198→        for n in range(40):
+   199→            self.wan_i2v_model.blocks[n].self_attn.init_kvidx(self.frame_len, self.world_size)
+   200→
+   201→        # 编译加速
+   202→        self.vae.model.eval()
+   203→        # self.vae.encode = torch.compile(self.vae.encode)
+   204→        self.vae.decode = torch.compile(self.vae.decode)
+   205→
+   206→        # 预热
+   207→        print("开始预热")
+   208→        start_time = time.perf_counter()
+   209→        self._warmup()
+   210→        print(f"Total Warmup time {time.perf_counter() - start_time:.4f}s")
+   211→
+   212→    def _warmup(self):
+   213→        print(f"[Warmup][Rank {self.rank}] start", flush=True)
+   214→
+   215→        if dist.is_initialized():
+   216→            dist.barrier()
+   217→        torch.cuda.empty_cache()
+   218→        torch.cuda.synchronize(self.device)
+   219→
+   220→        try:
+   221→            with torch.no_grad():
+   222→                frame_num_init = (sum(self.blksz_lst) - 1) * 4 + 1
+   223→                # 1. 准备假图像
+   224→                cond_image = torch.randn(
+   225→                    1, 3, 1, self.height, self.width,
+   226→                    device=self.device, dtype=torch.bfloat16
+   227→                ).clamp_(-1, 1)
+   228→                # 2. CLIP
+   229→                with torch.autocast("cuda", dtype=torch.bfloat16):
+   230→                    clip_context = self.clip.visual(cond_image)
+   231→
+   232→                # 3. 假音频
+   233→                dummy_audio = torch.randn(16000 * 6)
+   234→                audio_embedding = get_embedding(
+   235→                    dummy_audio,
+   236→                    self.wav2vec_feature_extractor,
+   237→                    self.audio_encoder,
+   238→                    device=self.device)
+   239→                # 4. init y
+   240→                ref_target_masks = torch.ones(
+   241→                    3,
+   242→                    self.height // self.vae_stride[1],
+   243→                    self.width // self.vae_stride[2],
+   244→                    device=self.device,
+   245→                    dtype=torch.bfloat16)
+   246→
+   247→                video_frames_placeholder = torch.zeros(
+   248→                    1,
+   249→                    cond_image.shape[1],
+   250→                    frame_num_init - cond_image.shape[2],
+   251→                    self.height,
+   252→                    self.width,
+   253→                    device=self.device,
+   254→                    dtype=torch.bfloat16)
+   255→
+   256→                padding_frames = torch.concat([cond_image, video_frames_placeholder], dim=2)
+   257→
+   258→                with torch.autocast("cuda", dtype=torch.bfloat16):
+   259→                    y = self.vae.encode(padding_frames).to(self.device).unsqueeze(0)
+   260→
+   261→                msk = get_msk(frame_num_init, cond_image, self.vae_stride, self.device)
+   262→                y = torch.concat([msk, y], dim=1)
+   263→
+   264→                # 5. prompt
+   265→                context = [
+   266→                    self.text_encoder(
+   267→                        texts="A person is speaking naturally.",
+   268→                        device='cpu' if self.args.t5_cpu else self.device
+   269→                    )[0].to(self.device, dtype=torch.bfloat16)
+   270→                ]
+   271→
+   272→                # 6. 完全按原逻辑跑，只是 iter_total_num = 2
+   273→                iter_total_num = 2
+   274→                pre_latent = None
+   275→
+   276→                for iteration in range(iter_total_num):
+   277→                    audio_start_idx = 0 if iteration == 0 else (iteration - 1) * self.blksz_lst[-1] * self.vae_stride[0]
+   278→                    audio_end_idx = audio_start_idx + frame_num_init
+   279→
+   280→                    audio_embs = get_audio_emb(audio_embedding, audio_start_idx, audio_end_idx, self.device)
+   281→
+   282→                    y_cut = y[:, :, :frame_num_init // 4 + 1, ...]
+   283→                    f_idx = 0 if iteration == 0 else 1
+   284→                    latent = torch.randn(
+   285→                        16,
+   286→                        self.blksz_lst[f_idx],
+   287→                        self.height // self.vae_stride[1],
+   288→                        self.width // self.vae_stride[2],
+   289→                        dtype=torch.bfloat16,
+   290→                        device=self.device
+   291→                    )
+   292→
+   293→                    with torch.autocast("cuda", dtype=torch.bfloat16):
+   294→                        for i in range(len(self.timesteps) - 1):
+   295→                            timestep = self.timesteps[i]
+   296→                            arg_c = {
+   297→                                'context': context,
+   298→                                'clip_fea': clip_context,
+   299→                                'ref_target_masks': ref_target_masks,
+   300→                                'audio': audio_embs,
+   301→                                'y': y_cut[:, :, sum(self.blksz_lst[:f_idx]):sum(self.blksz_lst[:f_idx + 1])],
+   302→                                'start_idx': sum(self.blksz_lst[:f_idx]) * self.frame_len,
+   303→                                'end_idx': sum(self.blksz_lst[:f_idx + 1]) * self.frame_len,
+   304→                                'update_cache': iteration > 1
+   305→                            }
+   306→
+   307→                            noise_pred = self.wan_i2v_model(
+   308→                                [latent],
+   309→                                t=timestep,
+   310→                                kv_cache=self.kv_cache[i],
+   311→                                skip_audio=False if i in [1, 2] else True,
+   312→                                **arg_c
+   313→                            )[0]
+   314→
+   315→                            dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
+   316→                            latent = latent + (-noise_pred) * dt[0]
+   317→
+   318→                        if iteration == 0:
+   319→                            _videos = self.vae.decode(latent)
+   320→                        else:
+   321→                            combined_latent = torch.concat([pre_latent[:, -3:], latent], dim=1)
+   322→                            _videos = self.vae.decode(combined_latent)[:, :, 9:]
+   323→
+   324→                        pre_latent = latent
+   325→                    torch.cuda.synchronize(self.device)
+   326→                    print(f"[Warmup][Rank {self.rank}] iteration {iteration + 1}/2 done", flush=True)
+   327→
+   328→                del cond_image, clip_context, dummy_audio, audio_embedding
+   329→                del ref_target_masks, video_frames_placeholder, padding_frames
+   330→                del y, msk, context, audio_embs, y_cut, latent, pre_latent, _videos
+   331→                if 'combined_latent' in locals():
+   332→                    del combined_latent
+   333→                if 'noise_pred' in locals():
+   334→                    del noise_pred
+   335→
+   336→                # torch.cuda.empty_cache()
+   337→                torch.cuda.synchronize(self.device)
+   338→
+   339→            if dist.is_initialized():
+   340→                dist.barrier()
+   341→
+   342→            print(f"[Warmup][Rank {self.rank}] done", flush=True)
+   343→        except Exception as e:
+   344→            print(f"[Warmup][Rank {self.rank}] failed: {e}", flush=True)
+   345→            raise
+   346→
+   347→    def generate_and_push(self, params):
+   348→        global streaming_active
+   349→
+   350→        prompt_list = params['prompt_list']
+   351→        fps = int(params['fps'])
+   352→        img_path = params['img_path']
+   353→        audio_path = params['audio_path']
+   354→        task_id = params['task_id']
+   355→        main_prompt = params['main_prompt']
+   356→        stream_with_audio = bool(params.get('stream_with_audio', False))
+   357→
+   358→        task_hls_dir = os.path.join(HLS_ROOT, task_id)
+   359→        final_video_path = os.path.join(self.video_save_root, f"{task_id}.mp4")
+   360→
+   361→        hls_ffmpeg_process = None
+   362→        save_ffmpeg_process = None
+   363→        stats = {}
+   364→
+   365→        def close_proc(proc, name="ffmpeg"):
+   366→            if proc is None:
+   367→                return
+   368→            try:
+   369→                if proc.stdin:
+   370→                    proc.stdin.close()
+   371→            except Exception:
+   372→                pass
+   373→            try:
+   374→                ret = proc.wait()
+   375→                if ret != 0:
+   376→                    print(f"[{name}] exited with code {ret}", flush=True)
+   377→            except Exception as e:
+   378→                print(f"[{name}] wait failed: {e}", flush=True)
+   379→
+   380→        def write_chunk_bytes(proc, chunk_bytes, name="ffmpeg"):
+   381→            if proc is None or proc.stdin is None:
+   382→                return
+   383→            try:
+   384→                proc.stdin.write(chunk_bytes)
+   385→                proc.stdin.flush()
+   386→            except BrokenPipeError:
+   387→                raise RuntimeError(f"{name} stdin broken pipe")
+   388→            except Exception as e:
+   389→                raise RuntimeError(f"write to {name} failed: {e}")
+   390→
+   391→        def tensor_chunk_to_rgb_bytes(video_tensor):
+   392→            """
+   393→            video_tensor: [1, 3, T, H, W] in [-1, 1]
+   394→            return:
+   395→                chunk_bytes: 整个 chunk 的连续 rgb24 bytes
+   396→                num_frames: 这个 chunk 的帧数
+   397→            """
+   398→            video_u8 = (
+   399→                ((video_tensor.squeeze(0).permute(1, 2, 3, 0) + 1.0) * 127.5)
+   400→                .clamp(0, 255)
+   401→                .to(torch.uint8)
+   402→                .contiguous()
+   403→                .cpu()
+   404→            )  # [T, H, W, C], uint8
+   405→            num_frames = video_u8.shape[0]
+   406→            chunk_bytes = video_u8.numpy().tobytes()
+   407→            return chunk_bytes, num_frames
+   408→
+   409→        try:
+   410→            if self.rank == 0:
+   411→                update_task_status(
+   412→                    task_id,
+   413→                    status="running",
+   414→                    stage="preparing",
+   415→                    message="开始预处理",
+   416→                    generated_chunks=0,
+   417→                    is_done=False,
+   418→                    error=None,
+   419→                    stream_ready=False,
+   420→                )
+   421→
+   422→            # 1. 音频特征预处理
+   423→            if self.rank == 0:
+   424→                start_time = time.perf_counter()
+   425→
+   426→            audio_ori, sr_ori = torchaudio.load(audio_path)
+   427→            audio_resampled, _ = resample_audio(audio_ori, sr_ori, fps)
+   428→            audio_embedding = get_embedding(
+   429→                audio_resampled[0],
+   430→                self.wav2vec_feature_extractor,
+   431→                self.audio_encoder,
+   432→                device=self.device
+   433→            )
+   434→            audio_len_sec = audio_ori.size(1) / sr_ori
+   435→
+   436→            if self.rank == 0:
+   437→                stats['audio_proc'] = time.perf_counter() - start_time
+   438→                update_task_status(task_id, stage="audio_ready", message="音频加载完成")
+   439→
+   440→            # 2. Rank0 启动 ffmpeg
+   441→            if self.rank == 0:
+   442→                start_time = time.perf_counter()
+   443→
+   444→                if os.path.exists(task_hls_dir):
+   445→                    shutil.rmtree(task_hls_dir)
+   446→                os.makedirs(task_hls_dir, exist_ok=True)
+   447→
+   448→                if os.path.exists(final_video_path):
+   449→                    os.remove(final_video_path)
+   450→
+   451→                # ---------- HLS ffmpeg ----------
+   452→                hls_ffmpeg_cmd = [
+   453→                    'ffmpeg',
+   454→                    '-y',
+   455→                    '-loglevel', 'warning',
+   456→
+   457→                    # rawvideo input
+   458→                    '-f', 'rawvideo',
+   459→                    '-vcodec', 'rawvideo',
+   460→                    '-pix_fmt', 'rgb24',
+   461→                    '-s', f'{self.width}x{self.height}',
+   462→                    '-r', str(fps),
+   463→                    '-i', 'pipe:0',
+   464→                ]
+   465→
+   466→                if stream_with_audio:
+   467→                    hls_ffmpeg_cmd += [
+   468→                        '-thread_queue_size', '1024',
+   469→                        '-i', audio_path,
+   470→                        '-map', '0:v:0',
+   471→                        '-map', '1:a:0',
+   472→                        '-c:a', 'aac',
+   473→                        '-b:a', '192k',
+   474→                        '-af', 'aresample=async=1:first_pts=0',
+   475→                        '-shortest',
+   476→                    ]
+   477→                else:
+   478→                    hls_ffmpeg_cmd += [
+   479→                        '-an',
+   480→                        '-map', '0:v:0',
+   481→                    ]
+   482→
+   483→                hls_ffmpeg_cmd += [
+   484→                    '-c:v', 'libx264',
+   485→                    '-pix_fmt', 'yuv420p',
+   486→                    '-preset', 'ultrafast',
+   487→                    '-tune', 'zerolatency',
+   488→
+   489→                    # 固定 1 秒一个关键帧，方便 HLS 切片
+   490→                    '-g', str(fps),
+   491→                    '-keyint_min', str(fps),
+   492→                    '-sc_threshold', '0',
+   493→
+   494→                    '-f', 'hls',
+   495→                    '-hls_time', '1',
+   496→                    '-hls_list_size', '5',
+   497→                    '-hls_segment_type', 'mpegts',
+   498→                    '-hls_flags', 'delete_segments+append_list+independent_segments',
+   499→                    os.path.join(task_hls_dir, M3U8_NAME)
+   500→                ]
+   501→
+   502→                print(f"[Generate][{task_id}] hls_ffmpeg_cmd = {' '.join(map(str, hls_ffmpeg_cmd))}", flush=True)
+   503→                hls_ffmpeg_process = subprocess.Popen(
+   504→                    hls_ffmpeg_cmd,
+   505→                    stdin=subprocess.PIPE,
+   506→                    bufsize=0
+   507→                )
+   508→
+   509→                # ---------- 保存 mp4 ffmpeg ----------
+   510→                # 直接带音频保存，不再先写 silent.mp4 再二次 mux
+   511→                save_ffmpeg_cmd = [
+   512→                    'ffmpeg',
+   513→                    '-y',
+   514→                    '-loglevel', 'warning',
+   515→
+   516→                    '-f', 'rawvideo',
+   517→                    '-vcodec', 'rawvideo',
+   518→                    '-pix_fmt', 'rgb24',
+   519→                    '-s', f'{self.width}x{self.height}',
+   520→                    '-r', str(fps),
+   521→                    '-i', 'pipe:0',
+   522→
+   523→                    '-thread_queue_size', '1024',
+   524→                    '-i', audio_path,
+   525→
+   526→                    '-map', '0:v:0',
+   527→                    '-map', '1:a:0',
+   528→
+   529→                    '-c:v', 'libx264',
+   530→                    '-pix_fmt', 'yuv420p',
+   531→                    '-preset', 'ultrafast',
+   532→                    '-c:a', 'aac',
+   533→                    '-b:a', '192k',
+   534→                    '-af', 'aresample=async=1:first_pts=0',
+   535→                    '-shortest',
+   536→                    '-movflags', '+faststart',
+   537→                    final_video_path
+   538→                ]
+   539→
+   540→                print(f"[Generate][{task_id}] save_ffmpeg_cmd = {' '.join(map(str, save_ffmpeg_cmd))}", flush=True)
+   541→                save_ffmpeg_process = subprocess.Popen(
+   542→                    save_ffmpeg_cmd,
+   543→                    stdin=subprocess.PIPE,
+   544→                    bufsize=0
+   545→                )
+   546→
+   547→                stats['ffmpeg_proc'] = time.perf_counter() - start_time
+   548→                update_task_status(task_id, stage="ffmpeg_ready", message="推流器已启动")
+   549→
+   550→            # 3. 图像 / 条件
+   551→            if self.rank == 0:
+   552→                start_time = time.perf_counter()
+   553→
+   554→            image = Image.open(img_path).convert("RGB")
+   555→            cond_image = self.transform(image).unsqueeze(1).unsqueeze(0).to(self.device, torch.bfloat16)
+   556→
+   557→            if self.rank == 0:
+   558→                stats['image_proc'] = time.perf_counter() - start_time
+   559→
+   560→            if self.rank == 0:
+   561→                start_time = time.perf_counter()
+   562→
+   563→            with torch.no_grad():
+   564→                clip_context = self.clip.visual(cond_image)
+   565→
+   566→            if self.rank == 0:
+   567→                stats['clip_proc'] = time.perf_counter() - start_time
+   568→
+   569→            if self.rank == 0:
+   570→                start_time = time.perf_counter()
+   571→
+   572→            torch.manual_seed(self.args.seed)
+   573→            ref_target_masks = torch.ones(
+   574→                3,
+   575→                self.height // self.vae_stride[1],
+   576→                self.width // self.vae_stride[2],
+   577→                device=self.device,
+   578→                dtype=torch.bfloat16
+   579→            )
+   580→            frame_num_init = (sum(self.blksz_lst) - 1) * 4 + 1
+   581→            msk = get_msk(frame_num_init, cond_image, self.vae_stride, self.device)
+   582→            video_frames_placeholder = torch.zeros(
+   583→                1,
+   584→                cond_image.shape[1],
+   585→                frame_num_init - cond_image.shape[2],
+   586→                self.height,
+   587→                self.width,
+   588→                device=self.device,
+   589→                dtype=torch.bfloat16
+   590→            )
+   591→            padding_frames = torch.concat([cond_image, video_frames_placeholder], dim=2)
+   592→            y = self.vae.encode(padding_frames).to(self.device).unsqueeze(0)
+   593→            y = torch.concat([msk, y], dim=1)
+   594→
+   595→            if self.rank == 0:
+   596→                stats['init_y'] = time.perf_counter() - start_time
+   597→
+   598→            if self.rank == 0:
+   599→                start_time = time.perf_counter()
+   600→
+   601→            edit_prompts = {}
+   602→            if prompt_list:
+   603→                for edit_prompt in prompt_list:
+   604→                    key = (edit_prompt[0], edit_prompt[1])
+   605→                    edit_prompts[key] = [
+   606→                        self.text_encoder(
+   607→                            texts=edit_prompt[2],
+   608→                            device='cpu' if self.args.t5_cpu else self.device
+   609→                        )[0].to(self.device, dtype=torch.bfloat16)
+   610→                    ]
+   611→
+   612→            context_0 = [
+   613→                self.text_encoder(
+   614→                    texts=main_prompt,
+   615→                    device='cpu' if self.args.t5_cpu else self.device
+   616→                )[0].to(self.device, dtype=torch.bfloat16)
+   617→            ]
+   618→
+   619→            if self.rank == 0:
+   620→                stats['prompt_init'] = time.perf_counter() - start_time
+   621→
+   622→            print("\n" + "=" * 30)
+   623→            print(f"Task {task_id} Pre-processing Report:")
+   624→            for stage, duration in stats.items():
+   625→                print(f" - {stage:20}: {duration:.4f}s")
+   626→            print("=" * 30 + "\n")
+   627→
+   628→            # 4. 主循环
+   629→            iter_total_num = int(audio_len_sec / (self.vae_stride[0] * self.blksz_lst[-1] / fps)) + 1
+   630→            pre_latent = None
+   631→
+   632→            if self.rank == 0:
+   633→                update_task_status(
+   634→                    task_id,
+   635→                    status="running",
+   636→                    stage="generating",
+   637→                    message=f"计划生成 {iter_total_num} 个 chunk",
+   638→                    total_chunks=iter_total_num,
+   639→                    generated_chunks=0,
+   640→                    is_done=False,
+   641→                )
+   642→
+   643→            for iteration in range(iter_total_num):
+   644→                if self.rank == 0:
+   645→                    start_time = time.perf_counter()
+   646→
+   647→                cached_context = context_0
+   648→                if prompt_list:
+   649→                    for k, v in edit_prompts.items():
+   650→                        if k[0] <= iteration <= k[1]:
+   651→                            cached_context = v
+   652→                            break
+   653→
+   654→                audio_start_idx = 0 if iteration == 0 else (iteration - 1) * self.blksz_lst[-1] * self.vae_stride[0]
+   655→                audio_end_idx = audio_start_idx + frame_num_init
+   656→                audio_embs = get_audio_emb(audio_embedding, audio_start_idx, audio_end_idx, self.device)
+   657→
+   658→                y_cut = y[:, :, :frame_num_init // 4 + 1, ...]
+   659→                f_idx = 0 if iteration == 0 else 1
+   660→
+   661→                latent = torch.randn(
+   662→                    16,
+   663→                    self.blksz_lst[f_idx],
+   664→                    self.height // self.vae_stride[1],
+   665→                    self.width // self.vae_stride[2],
+   666→                    dtype=torch.bfloat16,
+   667→                    device=self.device
+   668→                )
+   669→
+   670→                with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+   671→                    for i in range(len(self.timesteps) - 1):
+   672→                        timestep = self.timesteps[i]
+   673→                        arg_c = {
+   674→                            'context': cached_context,
+   675→                            'clip_fea': clip_context,
+   676→                            'ref_target_masks': ref_target_masks,
+   677→                            'audio': audio_embs,
+   678→                            'y': y_cut[:, :, sum(self.blksz_lst[:f_idx]):sum(self.blksz_lst[:f_idx + 1])],
+   679→                            'start_idx': sum(self.blksz_lst[:f_idx]) * self.frame_len,
+   680→                            'end_idx': sum(self.blksz_lst[:f_idx + 1]) * self.frame_len,
+   681→                            'update_cache': iteration > 1
+   682→                        }
+   683→                        noise_pred = self.wan_i2v_model(
+   684→                            [latent],
+   685→                            t=timestep,
+   686→                            kv_cache=self.kv_cache[i],
+   687→                            skip_audio=False if i in [1, 2] else True,
+   688→                            **arg_c
+   689→                        )[0]
+   690→                        dt = (self.timesteps[i] - self.timesteps[i + 1]) / 1000
+   691→                        latent = latent + (-noise_pred) * dt[0]
+   692→
+   693→                    if iteration == 0:
+   694→                        _videos = self.vae.decode(latent)
+   695→                    else:
+   696→                        combined_latent = torch.concat([pre_latent[:, -3:], latent], dim=1)
+   697→                        _videos = self.vae.decode(combined_latent)[:, :, 9:]
+   698→
+   699→                    pre_latent = latent
+   700→
+   701→                if self.rank == 0:
+   702→                    # 这里改成“整个 chunk 一次写入”
+   703→                    chunk_bytes, num_frames_this_chunk = tensor_chunk_to_rgb_bytes(_videos)
+   704→
+   705→                    write_chunk_bytes(hls_ffmpeg_process, chunk_bytes, name="hls_ffmpeg")
+   706→                    write_chunk_bytes(save_ffmpeg_process, chunk_bytes, name="save_ffmpeg")
+   707→
+   708→                    m3u8_path = os.path.join(task_hls_dir, M3U8_NAME)
+   709→                    update_task_status(
+   710→                        task_id,
+   711→                        status="running",
+   712→                        stage="generating",
+   713→                        message=f"已生成 {iteration + 1}/{iter_total_num} 个 chunk",
+   714→                        total_chunks=iter_total_num,
+   715→                        generated_chunks=iteration + 1,
+   716→                        is_done=False,
+   717→                        stream_ready=os.path.exists(m3u8_path),
+   718→                    )
+   719→
+   720→                    print(
+   721→                        f"生成完成 {iteration + 1}/{iter_total_num}, "
+   722→                        f"frames={num_frames_this_chunk}, "
+   723→                        f"一个chunk耗时:{time.perf_counter() - start_time:.4f}s",
+   724→                        flush=True
+   725→                    )
+   726→
+   727→            # 5. 收尾
+   728→            if self.rank == 0:
+   729→                update_task_status(
+   730→                    task_id,
+   731→                    status="running",
+   732→                    stage="finalizing",
+   733→                    message="视频生成完成，正在封装最终文件",
+   734→                    is_done=False,
+   735→                )
+   736→
+   737→                close_proc(hls_ffmpeg_process, name="hls_ffmpeg")
+   738→                close_proc(save_ffmpeg_process, name="save_ffmpeg")
+   739→
+   740→                print(f"[Save] 最终视频已保存到: {final_video_path}", flush=True)
+   741→
+   742→                update_task_status(
+   743→                    task_id,
+   744→                    status="finished",
+   745→                    stage="finished",
+   746→                    message="生成完成",
+   747→                    total_chunks=iter_total_num,
+   748→                    generated_chunks=iter_total_num,
+   749→                    is_done=True,
+   750→                    stream_ready=True,
+   751→                    error=None,
+   752→                    final_video_path=final_video_path,
+   753→                )
+   754→
+   755→        except Exception as e:
+   756→            print(f"[Generate] 生成失败: {e}", flush=True)
+   757→
+   758→            if self.rank == 0:
+   759→                try:
+   760→                    close_proc(hls_ffmpeg_process, name="hls_ffmpeg")
+   761→                    close_proc(save_ffmpeg_process, name="save_ffmpeg")
+   762→                except Exception:
+   763→                    pass
+   764→
+   765→                update_task_status(
+   766→                    task_id,
+   767→                    status="failed",
+   768→                    stage="failed",
+   769→                    message=f"生成失败: {e}",
+   770→                    is_done=True,
+   771→                    error=str(e),
+   772→                )
+   773→                streaming_active = False
+   774→            raise
+   775→
+   776→        finally:
+   777→            if self.rank == 0:
+   778→                streaming_active = False
+   779→
+   780→
+   781→# ================= 4. Flask 路由 (与前端对接) =================
+   782→def control_loop_rank0():
+   783→    global streaming_active
+   784→
+   785→    while True:
+   786→        try:
+   787→            params = task_queue.get(timeout=1.0)
+   788→        except queue.Empty:
+   789→            params = None
+   790→
+   791→        if engine.use_dist:
+   792→            payload = [params]
+   793→            dist.broadcast_object_list(payload, src=0, group=engine.control_pg)
+   794→
+   795→        if params is None:
+   796→            continue
+   797→
+   798→        try:
+   799→            update_task_status(
+   800→                params['task_id'],
+   801→                status="running",
+   802→                stage="starting",
+   803→                message="任务开始执行"
+   804→            )
+   805→            engine.generate_and_push(params)
+   806→        finally:
+   807→            streaming_active = False
+   808→
+   809→
+   810→def control_loop_rank_other():
+   811→    if not engine.use_dist:
+   812→        return
+   813→    while True:
+   814→        payload = [None]
+   815→        dist.broadcast_object_list(payload, src=0, group=engine.control_pg)
+   816→        params = payload[0]
+   817→
+   818→        if params is None:
+   819→            continue
+   820→
+   821→        engine.generate_and_push(params)
+   822→        torch.cuda.empty_cache()
+   823→        gc.collect()
+   824→
+   825→
+   826→@app.route('/')
+   827→def index():
+   828→    return render_template('index.html', stream_resolution=engine.args.size.replace('*', 'x'))
+   829→
+   830→
+   831→@app.route('/start_stream', methods=['POST'])
+   832→def start_stream():
+   833→    global streaming_active
+   834→
+   835→    if streaming_active:
+   836→        return jsonify({"status": "error", "message": "GPU 任务繁忙，请稍后再试"}), 429
+   837→
+   838→    task_id = request.form.get('task_id')
+   839→    main_prompt = (request.form.get('main_prompt') or '').strip()
+   840→    prompt_json = request.form.get('prompt_json') or '[]'
+   841→    fps = request.form.get('fps')
+   842→    prompt_list = json.loads(prompt_json)
+   843→
+   844→    stream_with_audio = str(request.form.get('stream_with_audio', 'false')).lower() in ('1', 'true', 'yes', 'on')
+   845→    img_file = request.files.get('img_file')
+   846→    audio_file = request.files.get('audio_file')
+   847→    if not task_id:
+   848→        return jsonify({"status": "error", "message": "缺少 task_id"}), 400
+   849→    if not img_file or not audio_file:
+   850→        return jsonify({"status": "error", "message": "缺少图片或音频文件"}), 400
+   851→    if not fps:
+   852→        return jsonify({"status": "error", "message": "缺少 fps"}), 400
+   853→    task_upload_dir = os.path.join(UPLOAD_ROOT, task_id)
+   854→    os.makedirs(task_upload_dir, exist_ok=True)
+   855→    img_path = os.path.join(task_upload_dir, "input.png")
+   856→    audio_path = os.path.join(task_upload_dir, "input.wav")
+   857→    img_file.save(img_path)
+   858→    audio_file.save(audio_path)
+   859→    params = {
+   860→        'task_id': task_id,
+   861→        'prompt_list': prompt_list,
+   862→        'main_prompt': main_prompt,
+   863→        'fps': int(fps),
+   864→        'img_path': img_path,
+   865→        'audio_path': audio_path,
+   866→        'stream_with_audio': stream_with_audio, }
+   867→
+   868→    update_task_status(
+   869→        task_id,
+   870→        status="queued",
+   871→        stage="queued",
+   872→        message="任务已入队，等待执行",
+   873→        total_chunks=None,
+   874→        generated_chunks=0,
+   875→        is_done=False,
+   876→        stream_ready=False,
+   877→        error=None,
+   878→        stream_with_audio=stream_with_audio, )
+   879→
+   880→    streaming_active = True
+   881→    task_queue.put(params)
+   882→    return jsonify({
+   883→        "status": "success",
+   884→        "task_id": task_id,
+   885→        "stream_with_audio": stream_with_audio
+   886→    })
+   887→
+   888→
+   889→@app.route('/stream/<task_id>/<path:filename>')
+   890→def serve_hls(task_id, filename):
+   891→    return send_from_directory(os.path.join(HLS_ROOT, task_id), filename)
+   892→
+   893→
+   894→@app.route('/task_status/<task_id>', methods=['GET'])
+   895→def task_status(task_id):
+   896→    data = get_task_status(task_id)
+   897→    if data is None:
+   898→        return jsonify({
+   899→            "status": "not_found",
+   900→            "message": "task_id 不存在"
+   901→        }), 404
+   902→    return jsonify(data)
+   903→
+   904→
+   905→# ================= 5. 分布式启动 =================
+   906→
+   907→
+   908→if __name__ == '__main__':
+   909→    parser = argparse.ArgumentParser()
+   910→    parser.add_argument("--ckpt_dir", type=str, required=True)
+   911→    parser.add_argument("--wav2vec_dir", type=str, required=True)
+   912→    parser.add_argument("--t5_cpu", action="store_true")
+   913→    parser.add_argument("--port", type=int, default=5001)
+   914→    parser.add_argument("--seed", type=int, default=42)
+   915→    parser.add_argument(
+   916→        "--size", type=str, default="720*416",
+   917→        help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image.")
+   918→    parser.add_argument("--video_save_path", type=str, default="./generated_videos",
+   919→                        help="Directory to save final generated videos.")
+   920→    parser.add_argument(
+   921→        "--fp8_kv_cache",
+   922→        action="store_true",
+   923→        default=False,
+   924→        help="Whether to store kv cache in FP8 and dequantize to BF16 on use.")
+   925→    parser.add_argument(
+   926→        "--block_offload",
+   927→        action="store_true",
+   928→        default=False,
+   929→        help="Whether to offload WanModel blocks to CPU between block forwards.")
+   930→    args = parser.parse_args()
+   931→
+   932→    try:
+   933→        engine = DistributedVideoEngine(args)
+   934→        if engine.rank == 0:
+   935→            threading.Thread(target=control_loop_rank0, daemon=True).start()
+   936→
+   937→            ip = get_local_ip()
+   938→            print(f"\n🚀 LiveAct 服务启动!")
+   939→            print(f"访问地址: http://{ip}:{args.port}\n")
+   940→            app.run(host='0.0.0.0', port=args.port, threaded=True, debug=False)
+   941→        else:
+   942→            print(f"节点 Rank {engine.rank} 等待指令...")
+   943→            control_loop_rank_other()
+   944→    finally:
+   945→        if dist.is_initialized():
+   946→            dist.destroy_process_group()

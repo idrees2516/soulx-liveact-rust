@@ -1,0 +1,1139 @@
+     1→# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+     2→import copy
+     3→import math
+     4→import numpy as np
+     5→import os
+     6→import torch
+     7→import torch.cuda.amp as amp
+     8→import torch.nn as nn
+     9→import torch.nn.functional as F
+    10→
+    11→from einops import rearrange
+    12→from diffusers import ModelMixin
+    13→from diffusers.configuration_utils import ConfigMixin, register_to_config
+    14→from diffusers.loaders import PeftAdapterMixin
+    15→
+    16→from .attention import flash_attention, SingleStreamAttention, sdpa_attention, flex_attention
+    17→from fp8_gemm import FP8Linear
+    18→from fp4_gemm import FP4Linear
+    19→import logging
+    20→
+    21→try:
+    22→    from sageattention import sageattn
+    23→
+    24→    USE_SAGEATTN = True
+    25→    logging.info("Using sageattn")
+    26→except:
+    27→    USE_SAGEATTN = False
+    28→
+    29→__all__ = ['WanModel']
+    30→
+    31→
+    32→def sinusoidal_embedding_1d(dim, position):
+    33→    # preprocess
+    34→    assert dim % 2 == 0
+    35→    half = dim // 2
+    36→    position = position.type(torch.float64)
+    37→
+    38→    # calculation
+    39→    sinusoid = torch.outer(
+    40→        position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+    41→    x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+    42→    return x
+    43→
+    44→
+    45→# @amp.autocast(enabled=False)
+    46→def rope_params(max_seq_len, dim, theta=10000):
+    47→    assert dim % 2 == 0
+    48→    freqs = torch.outer(
+    49→        torch.arange(max_seq_len),
+    50→        1.0 / torch.pow(theta,
+    51→                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+    52→    freqs = torch.polar(torch.ones_like(freqs), freqs)
+    53→    return freqs
+    54→
+    55→
+    56→def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
+    57→    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    58→
+    59→    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    60→
+    61→    output = []
+    62→    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    63→        seq_len = s
+    64→        f = int(seq_len // (h * w))
+    65→        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2))
+    66→        freqs_i = torch.cat([
+    67→            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+    68→            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+    69→            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+    70→        ],
+    71→            dim=-1).reshape(seq_len, 1, -1)
+    72→        freqs_i = freqs_i.to(device=x_i.device)
+    73→        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+    74→        x_i = torch.cat([x_i, x[i, seq_len:]])
+    75→
+    76→        output.append(x_i)
+    77→    return torch.stack(output)  # .float()
+    78→
+    79→
+    80→def rope_apply(x, grid_sizes, freqs, f_list=[], rope_list=[]):
+    81→    s, n, c = x.size(1), x.size(2), x.size(3) // 2
+    82→
+    83→    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    84→
+    85→    output = []
+    86→    for f_l, r_l in zip(f_list, rope_list):
+    87→        start_f, end_f = f_l
+    88→        start_r, end_r = r_l
+    89→        f = end_f - start_f
+    90→        _, h, w = grid_sizes.tolist()[0]
+    91→        seq_len = (end_f - start_f) * h * w
+    92→        x_i = torch.view_as_complex(
+    93→            x[0, start_f * h * w:end_f * h * w].to(torch.float64) \
+    94→                .reshape(seq_len, n, -1, 2)
+    95→        )
+    96→        freqs_i = torch.cat([
+    97→            freqs[0][start_r:end_r].view(f, 1, 1, -1).expand(f, h, w, -1),
+    98→            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+    99→            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+   100→        ],
+   101→            dim=-1).reshape(seq_len, 1, -1)
+   102→        freqs_i = freqs_i.to(device=x_i.device)
+   103→        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+   104→        output.append(x_i)
+   105→    return torch.concat(output, dim=0).unsqueeze(0)
+   106→
+   107→
+   108→class WanRMSNorm(nn.Module):
+   109→
+   110→    def __init__(self, dim, eps=1e-5):
+   111→        super().__init__()
+   112→        self.dim = dim
+   113→        self.eps = eps
+   114→        self.weight = nn.Parameter(torch.ones(dim))
+   115→
+   116→    def forward(self, x):
+   117→        r"""
+   118→        Args:
+   119→            x(Tensor): Shape [B, L, C]
+   120→        """
+   121→        return self._norm(x.float()).type_as(x) * self.weight
+   122→
+   123→    def _norm(self, x):
+   124→        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+   125→
+   126→
+   127→class WanLayerNorm(nn.LayerNorm):
+   128→
+   129→    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+   130→        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+   131→
+   132→    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+   133→        origin_dtype = inputs.dtype
+   134→        out = F.layer_norm(
+   135→            inputs.float(),
+   136→            self.normalized_shape,
+   137→            None if self.weight is None else self.weight.float(),
+   138→            None if self.bias is None else self.bias.float(),
+   139→            self.eps
+   140→        ).to(origin_dtype)
+   141→        return out
+   142→
+   143→
+   144→class WanSelfAttention(nn.Module):
+   145→
+   146→    def __init__(self,
+   147→                 dim,
+   148→                 num_heads,
+   149→                 window_size=(-1, -1),
+   150→                 qk_norm=True,
+   151→                 eps=1e-6):
+   152→        assert dim % num_heads == 0
+   153→        super().__init__()
+   154→        self.dim = dim
+   155→        self.num_heads = num_heads
+   156→        self.head_dim = dim // num_heads
+   157→        self.window_size = window_size
+   158→        self.qk_norm = qk_norm
+   159→        self.eps = eps
+   160→
+   161→        # layers
+   162→        self.q = nn.Linear(dim, dim)
+   163→        self.k = nn.Linear(dim, dim)
+   164→        self.v = nn.Linear(dim, dim)
+   165→        self.o = nn.Linear(dim, dim)
+   166→        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+   167→        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+   168→        self.attn_mask = None
+   169→        self.memory_proj_k = nn.Conv1d(self.dim, self.dim, kernel_size=5, stride=5, groups=self.dim, bias=False)
+   170→        self.memory_proj_v = nn.Conv1d(self.dim, self.dim, kernel_size=5, stride=5, groups=self.dim, bias=False)
+   171→
+   172→    def post_init(self, device):
+   173→        self.memory_proj_k = nn.Conv1d(self.dim, self.dim, kernel_size=5, stride=5, groups=self.dim, bias=False).to(
+   174→            device, dtype=torch.bfloat16)
+   175→        self.memory_proj_v = nn.Conv1d(self.dim, self.dim, kernel_size=5, stride=5, groups=self.dim, bias=False).to(
+   176→            device, dtype=torch.bfloat16)
+   177→        nn.init.constant_(self.memory_proj_k.weight, 1.0 / 5.0)
+   178→        nn.init.constant_(self.memory_proj_v.weight, 1.0 / 5.0)
+   179→
+   180→    def k_compress(self, k, n_frame=5):
+   181→        B, N, H, C = k.shape
+   182→        assert N % n_frame == 0
+   183→        T = N // n_frame
+   184→        k = k.view(B, N, H * C).transpose(1, 2)
+   185→        k = self.memory_proj_k(k)
+   186→        k = k.view(B, H, C, T).permute(0, 3, 1, 2)
+   187→        return k
+   188→
+   189→    def v_compress(self, v, n_frame=5):
+   190→        B, N, H, C = v.shape
+   191→        assert N % n_frame == 0
+   192→        T = N // n_frame
+   193→        v = v.view(B, N, H * C).transpose(1, 2)
+   194→        v = self.memory_proj_k(v)
+   195→        v = v.view(B, H, C, T).permute(0, 3, 1, 2)
+   196→        return v
+   197→
+   198→    def kv_mean(self, kv, n_frame=5):
+   199→        B, N, H, C = kv.shape
+   200→        assert N % n_frame == 0
+   201→        T = N // n_frame
+   202→        kv = kv.view(B, T, n_frame, H, C).mean(dim=2)
+   203→        return kv
+   204→
+   205→    def init_kvidx(self, frame_len, world_size):
+   206→        self.kv_idx0 = torch.tensor(list(range(6 * frame_len // world_size)),
+   207→                                    device=f'cuda:{int(os.getenv("RANK", 0))}')
+   208→        self.kv_idx2 = torch.tensor(list(range(14 * frame_len // world_size)),
+   209→                                    device=f'cuda:{int(os.getenv("RANK", 0))}')
+   210→
+   211→    def _move_kv_cache_to_device(self, kv_cache, device):
+   212→        kv_cache["k"] = kv_cache["k"].to(device=device, non_blocking=True)
+   213→        kv_cache["v"] = kv_cache["v"].to(device=device, non_blocking=True)
+   214→        if kv_cache.get("k_scale") is not None:
+   215→            kv_cache["k_scale"] = kv_cache["k_scale"].to(device=device, non_blocking=True)
+   216→        if kv_cache.get("v_scale") is not None:
+   217→            kv_cache["v_scale"] = kv_cache["v_scale"].to(device=device, non_blocking=True)
+   218→
+   219→    def _quantize_kv_tensor(self, kv):
+   220→        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+   221→        scale = kv.detach().abs().amax(dim=-1, keepdim=True).to(torch.float32)
+   222→        scale = torch.clamp(scale / fp8_max, min=1e-12)
+   223→        q_kv = (kv / scale.to(dtype=kv.dtype)).to(torch.float8_e4m3fn)
+   224→        return q_kv.contiguous(), scale.contiguous()
+   225→
+   226→    def _dequantize_kv_tensor(self, q_kv, scale, dtype):
+   227→        return q_kv.to(dtype=dtype) * scale.to(device=q_kv.device, dtype=dtype)
+   228→
+   229→    def _load_kv_cache(self, kv_cache, device, dtype):
+   230→        if kv_cache["offload_cache"]:
+   231→            self._move_kv_cache_to_device(kv_cache, device)
+   232→
+   233→        if kv_cache.get("fp8_kv_cache", False):
+   234→            k_cache = self._dequantize_kv_tensor(kv_cache["k"], kv_cache["k_scale"], dtype)
+   235→            v_cache = self._dequantize_kv_tensor(kv_cache["v"], kv_cache["v_scale"], dtype)
+   236→        else:
+   237→            if kv_cache["k"].dtype != dtype:
+   238→                kv_cache["k"] = kv_cache["k"].to(dtype=dtype)
+   239→            if kv_cache["v"].dtype != dtype:
+   240→                kv_cache["v"] = kv_cache["v"].to(dtype=dtype)
+   241→            k_cache = kv_cache["k"]
+   242→            v_cache = kv_cache["v"]
+   243→        return k_cache, v_cache
+   244→
+   245→    def _store_kv_cache(self, kv_cache, k_cache, v_cache):
+   246→        if kv_cache.get("fp8_kv_cache", False):
+   247→            kv_cache["k"], kv_cache["k_scale"] = self._quantize_kv_tensor(k_cache)
+   248→            kv_cache["v"], kv_cache["v_scale"] = self._quantize_kv_tensor(v_cache)
+   249→        else:
+   250→            kv_cache["k"] = k_cache
+   251→            kv_cache["v"] = v_cache
+   252→
+   253→        if kv_cache["offload_cache"]:
+   254→            self._move_kv_cache_to_device(kv_cache, 'cpu')
+   255→
+   256→    def forward(self, x, seq_lens, grid_sizes, freqs, kv_cache={}, start_idx=None, end_idx=None, update_cache=False):
+   257→        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
+   258→
+   259→        # query, key, value function
+   260→        def qkv_fn(x):
+   261→            q = self.norm_q(self.q(x)).view(b, s, n, d)
+   262→            k = self.norm_k(self.k(x)).view(b, s, n, d)
+   263→            v = self.v(x).view(b, s, n, d)
+   264→            return q, k, v
+   265→
+   266→        q, k, v = qkv_fn(x)
+   267→        k_cache, v_cache = self._load_kv_cache(kv_cache, f'cuda:{int(os.getenv("RANK", 0))}', torch.bfloat16)
+   268→
+   269→        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+   270→        current_start_frame = start_idx // frame_seqlen
+   271→
+   272→        if update_cache:
+   273→            if kv_cache["mean_memory"]:
+   274→                k_compress, v_compress = self.kv_mean, self.kv_mean
+   275→            else:
+   276→                k_compress, v_compress = self.k_compress, self.v_compress
+   277→            k_cache[:, 2 * frame_seqlen: 3 * frame_seqlen].copy_(
+   278→                k_compress(k_cache[:, 2 * frame_seqlen: 7 * frame_seqlen]))
+   279→            v_cache[:, 2 * frame_seqlen: 3 * frame_seqlen].copy_(
+   280→                v_compress(v_cache[:, 2 * frame_seqlen: 7 * frame_seqlen]))
+   281→            k_cache[:, 3 * frame_seqlen: 4 * frame_seqlen].copy_(
+   282→                k_compress(k_cache[:, 7 * frame_seqlen: 12 * frame_seqlen]))
+   283→            v_cache[:, 3 * frame_seqlen: 4 * frame_seqlen].copy_(
+   284→                v_compress(v_cache[:, 7 * frame_seqlen: 12 * frame_seqlen]))
+   285→
+   286→            k_cache[:, 4 * frame_seqlen: 6 * frame_seqlen].copy_(k_cache[:, 12 * frame_seqlen: 14 * frame_seqlen])
+   287→            v_cache[:, 4 * frame_seqlen: 6 * frame_seqlen].copy_(v_cache[:, 12 * frame_seqlen: 14 * frame_seqlen])
+   288→
+   289→        if start_idx != 0:
+   290→            k_cache[:, 6 * frame_seqlen:] = k
+   291→            v_cache[:, 6 * frame_seqlen:] = v
+   292→        else:
+   293→            k_cache[:, : 6 * frame_seqlen] = k
+   294→            v_cache[:, : 6 * frame_seqlen] = v
+   295→
+   296→        roped_query = causal_rope_apply(q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+   297→        roped_key = causal_rope_apply(k_cache, grid_sizes, freqs, start_frame=0).type_as(v)
+   298→
+   299→        if USE_SAGEATTN:
+   300→            x = sageattn(
+   301→                roped_query,
+   302→                roped_key[:, :end_idx, ...],
+   303→                v_cache[:, :end_idx, ...],
+   304→                tensor_layout="NHD",
+   305→                is_causal=False,
+   306→            ).type_as(x)
+   307→        else:
+   308→            x = sdpa_attention(
+   309→                q=roped_query,
+   310→                k=roped_key[:, :end_idx, ...],
+   311→                v=v_cache[:, :end_idx, ...],
+   312→                k_lens=seq_lens,
+   313→                window_size=self.window_size,
+   314→                attn_mask=self.attn_mask,
+   315→            ).type_as(x)
+   316→
+   317→        self._store_kv_cache(kv_cache, k_cache, v_cache)
+   318→
+   319→        # output
+   320→        x = x.flatten(2)
+   321→        x = self.o(x)
+   322→        return x, None
+   323→
+   324→
+   325→class WanI2VCrossAttention(nn.Module):
+   326→
+   327→    def __init__(self,
+   328→                 dim,
+   329→                 num_heads,
+   330→                 window_size=(-1, -1),
+   331→                 qk_norm=True,
+   332→                 eps=1e-6):
+   333→        assert dim % num_heads == 0
+   334→        super().__init__()
+   335→        self.dim = dim
+   336→        self.num_heads = num_heads
+   337→        self.head_dim = dim // num_heads
+   338→        self.window_size = window_size
+   339→        self.qk_norm = qk_norm
+   340→        self.eps = eps
+   341→
+   342→        # layers
+   343→        self.q = nn.Linear(dim, dim)
+   344→        self.k = nn.Linear(dim, dim)
+   345→        self.v = nn.Linear(dim, dim)
+   346→        self.o = nn.Linear(dim, dim)
+   347→        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+   348→        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+   349→
+   350→        self.k_img = nn.Linear(dim, dim)
+   351→        self.v_img = nn.Linear(dim, dim)
+   352→        self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+   353→
+   354→    def forward(self, x, context, context_lens, cross_kv_cache={}):
+   355→        context_img = context[:, :257]
+   356→        context = context[:, 257:]
+   357→        b, n, d = x.size(0), self.num_heads, self.head_dim
+   358→
+   359→        # compute query, key, value
+   360→        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+   361→        k = self.norm_k(self.k(context)).view(b, -1, n, d)
+   362→        v = self.v(context).view(b, -1, n, d)
+   363→        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+   364→        v_img = self.v_img(context_img).view(b, -1, n, d)
+   365→        # if not cross_kv_cache:
+   366→        #     # print('----init cross_kv_cache!!!')
+   367→        #     k = self.norm_k(self.k(context)).view(b, -1, n, d)
+   368→        #     v = self.v(context).view(b, -1, n, d)
+   369→        #     k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+   370→        #     v_img = self.v_img(context_img).view(b, -1, n, d)
+   371→        #     cross_kv_cache['k'], cross_kv_cache['v'], cross_kv_cache['k_img'], cross_kv_cache['v_img'] = \
+   372→        #         k, v, k_img, v_img
+   373→        # else:
+   374→        #     # print('----use cross_kv_cache!!!')
+   375→        #     k, v, k_img, v_img = \
+   376→        #         cross_kv_cache['k'], cross_kv_cache['v'], cross_kv_cache['k_img'], cross_kv_cache['v_img']
+   377→        if USE_SAGEATTN:
+   378→            img_x = sageattn(q, k_img, v_img, tensor_layout='NHD')
+   379→            x = sageattn(q, k, v, tensor_layout='NHD')
+   380→        else:
+   381→            # img_x = flash_attention(q, k_img, v_img, k_lens=None)
+   382→            img_x = sdpa_attention(q, k_img, v_img, k_lens=None)
+   383→            # compute attention
+   384→            # x = flash_attention(q, k, v, k_lens=context_lens)
+   385→            x = sdpa_attention(q, k, v, k_lens=context_lens)
+   386→
+   387→        # output
+   388→        x = x.flatten(2)
+   389→        img_x = img_x.flatten(2)
+   390→        x = x + img_x
+   391→        x = self.o(x)
+   392→        return x
+   393→
+   394→
+   395→class WanAttentionBlock(nn.Module):
+   396→
+   397→    def __init__(self,
+   398→                 cross_attn_type,
+   399→                 dim,
+   400→                 ffn_dim,
+   401→                 num_heads,
+   402→                 window_size=(-1, -1),
+   403→                 qk_norm=True,
+   404→                 cross_attn_norm=False,
+   405→                 eps=1e-6,
+   406→                 output_dim=768,
+   407→                 norm_input_visual=True,
+   408→                 class_range=24,
+   409→                 class_interval=4):
+   410→        super().__init__()
+   411→        self.dim = dim
+   412→        self.ffn_dim = ffn_dim
+   413→        self.num_heads = num_heads
+   414→        self.window_size = window_size
+   415→        self.qk_norm = qk_norm
+   416→        self.cross_attn_norm = cross_attn_norm
+   417→        self.eps = eps
+   418→
+   419→        # layers
+   420→        self.norm1 = WanLayerNorm(dim, eps)
+   421→        self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
+   422→        self.norm3 = WanLayerNorm(
+   423→            dim, eps,
+   424→            elementwise_affine=True) if cross_attn_norm else nn.Identity()
+   425→        self.cross_attn = WanI2VCrossAttention(dim,
+   426→                                               num_heads,
+   427→                                               (-1, -1),
+   428→                                               qk_norm,
+   429→                                               eps)
+   430→        self.norm2 = WanLayerNorm(dim, eps)
+   431→        self.ffn = nn.Sequential(
+   432→            nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
+   433→            nn.Linear(ffn_dim, dim))
+   434→
+   435→        # modulation
+   436→        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim ** 0.5)
+   437→
+   438→        # init audio module
+   439→        self.audio_cross_attn = SingleStreamAttention(
+   440→            dim=dim,
+   441→            encoder_hidden_states_dim=output_dim,
+   442→            num_heads=num_heads,
+   443→            qk_norm=False,
+   444→            qkv_bias=True,
+   445→            eps=eps,
+   446→            norm_layer=WanRMSNorm,
+   447→            # class_range=class_range,
+   448→            # class_interval=class_interval
+   449→        )
+   450→        self.norm_x = WanLayerNorm(dim, eps, elementwise_affine=True) if norm_input_visual else nn.Identity()
+   451→
+   452→    def forward(
+   453→            self,
+   454→            x,
+   455→            e,
+   456→            seq_lens,
+   457→            grid_sizes,
+   458→            freqs,
+   459→            context,
+   460→            context_lens,
+   461→            kv_cache={},
+   462→            start_idx=None,
+   463→            end_idx=None,
+   464→            update_cache=False,
+   465→            cross_kv_cache={},
+   466→            audio_embedding=None,
+   467→            ref_target_masks=None,
+   468→            human_num=None,
+   469→            skip_audio=False,
+   470→    ):
+   471→
+   472→        dtype = x.dtype
+   473→        # assert e.dtype == torch.float32
+   474→        if len(e.shape) == 3:
+   475→            # with amp.autocast(dtype=torch.float32):
+   476→            e = (self.modulation.to(e.device) + e).chunk(6, dim=1)
+   477→        else:
+   478→            # with amp.autocast(dtype=torch.float32):
+   479→            e = (self.modulation.unsqueeze(-2).to(e.device) + e)[0].chunk(6, dim=0)
+   480→        # assert e[0].dtype == torch.float32
+   481→
+   482→        # self-attention
+   483→        y, x_ref_attn_map = self.self_attn(
+   484→            (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, grid_sizes,
+   485→            freqs, kv_cache=kv_cache, start_idx=start_idx, end_idx=end_idx, update_cache=update_cache)
+   486→        # with amp.autocast(dtype=torch.float32):
+   487→        x = x + y * e[2]
+   488→
+   489→        x = x.to(dtype)
+   490→
+   491→        # cross-attention of text
+   492→        x = x + self.cross_attn(self.norm3(x), context, context_lens, cross_kv_cache=cross_kv_cache)
+   493→
+   494→        # cross attn of audio
+   495→        if not skip_audio:
+   496→            frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+   497→            start_f = start_idx // frame_seqlen
+   498→            x_a = self.audio_cross_attn(self.norm_x(x), encoder_hidden_states=audio_embedding,
+   499→                                        shape=grid_sizes[0], start_f=start_f, USE_SAGEATTN=USE_SAGEATTN)
+   500→            if start_f == 0:
+   501→                x_a[:, :frame_seqlen] = 0
+   502→            x = x + x_a
+   503→
+   504→        y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(dtype))
+   505→        # with amp.autocast(dtype=torch.float32):
+   506→        x = x + y * e[5]
+   507→
+   508→        x = x.to(dtype)
+   509→
+   510→        return x
+   511→
+   512→
+   513→class Head(nn.Module):
+   514→
+   515→    def __init__(self, dim, out_dim, patch_size, eps=1e-6):
+   516→        super().__init__()
+   517→        self.dim = dim
+   518→        self.out_dim = out_dim
+   519→        self.patch_size = patch_size
+   520→        self.eps = eps
+   521→
+   522→        # layers
+   523→        out_dim = math.prod(patch_size) * out_dim
+   524→        self.norm = WanLayerNorm(dim, eps)
+   525→        self.head = nn.Linear(dim, out_dim)
+   526→
+   527→        # modulation
+   528→        self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim ** 0.5)
+   529→
+   530→    def forward(self, x, e):
+   531→        r"""
+   532→        Args:
+   533→            x(Tensor): Shape [B, L1, C]
+   534→            e(Tensor): Shape [B, C]
+   535→        """
+   536→        # assert e.dtype == torch.float32
+   537→        # with amp.autocast(dtype=torch.float32):
+   538→        e = (self.modulation.to(e.device) + e.unsqueeze(1)).chunk(2, dim=1)
+   539→        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+   540→        return x
+   541→
+   542→
+   543→class MLPProj(torch.nn.Module):
+   544→
+   545→    def __init__(self, in_dim, out_dim):
+   546→        super().__init__()
+   547→
+   548→        self.proj = torch.nn.Sequential(
+   549→            torch.nn.LayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
+   550→            torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
+   551→            torch.nn.LayerNorm(out_dim))
+   552→
+   553→    def forward(self, image_embeds):
+   554→        clip_extra_context_tokens = self.proj(image_embeds)
+   555→        return clip_extra_context_tokens
+   556→
+   557→
+   558→class AudioProjModel(ModelMixin, ConfigMixin):
+   559→    def __init__(
+   560→            self,
+   561→            seq_len=5,
+   562→            seq_len_vf=12,
+   563→            blocks=12,
+   564→            channels=768,
+   565→            intermediate_dim=512,
+   566→            output_dim=768,
+   567→            context_tokens=32,
+   568→            norm_output_audio=False,
+   569→    ):
+   570→        super().__init__()
+   571→
+   572→        self.seq_len = seq_len
+   573→        self.blocks = blocks
+   574→        self.channels = channels
+   575→        self.input_dim = seq_len * blocks * channels
+   576→        self.input_dim_vf = seq_len_vf * blocks * channels
+   577→        self.intermediate_dim = intermediate_dim
+   578→        self.context_tokens = context_tokens
+   579→        self.output_dim = output_dim
+   580→
+   581→        # define multiple linear layers
+   582→        self.proj1 = nn.Linear(self.input_dim, intermediate_dim)
+   583→        self.proj1_vf = nn.Linear(self.input_dim_vf, intermediate_dim)
+   584→        self.proj2 = nn.Linear(intermediate_dim, intermediate_dim)
+   585→        self.proj3 = nn.Linear(intermediate_dim, context_tokens * output_dim)
+   586→        self.norm = nn.LayerNorm(output_dim) if norm_output_audio else nn.Identity()
+   587→
+   588→    def forward(self, audio_embeds, audio_embeds_vf):
+   589→        video_length = audio_embeds.shape[1] + audio_embeds_vf.shape[1]
+   590→        B, _, _, S, C = audio_embeds.shape
+   591→
+   592→        # process audio of first frame
+   593→        audio_embeds = rearrange(audio_embeds, "bz f w b c -> (bz f) w b c")
+   594→        batch_size, window_size, blocks, channels = audio_embeds.shape
+   595→        audio_embeds = audio_embeds.view(batch_size, window_size * blocks * channels)
+   596→
+   597→        # process audio of latter frame
+   598→        audio_embeds_vf = rearrange(audio_embeds_vf, "bz f w b c -> (bz f) w b c")
+   599→        batch_size_vf, window_size_vf, blocks_vf, channels_vf = audio_embeds_vf.shape
+   600→        audio_embeds_vf = audio_embeds_vf.view(batch_size_vf, window_size_vf * blocks_vf * channels_vf)
+   601→
+   602→        # first projection
+   603→        audio_embeds = torch.relu(self.proj1(audio_embeds))
+   604→        audio_embeds_vf = torch.relu(self.proj1_vf(audio_embeds_vf))
+   605→        audio_embeds = rearrange(audio_embeds, "(bz f) c -> bz f c", bz=B)
+   606→        audio_embeds_vf = rearrange(audio_embeds_vf, "(bz f) c -> bz f c", bz=B)
+   607→        audio_embeds_c = torch.concat([audio_embeds, audio_embeds_vf], dim=1)
+   608→        batch_size_c, N_t, C_a = audio_embeds_c.shape
+   609→        audio_embeds_c = audio_embeds_c.view(batch_size_c * N_t, C_a)
+   610→
+   611→        # second projection
+   612→        audio_embeds_c = torch.relu(self.proj2(audio_embeds_c))
+   613→
+   614→        context_tokens = self.proj3(audio_embeds_c).reshape(batch_size_c * N_t, self.context_tokens, self.output_dim)
+   615→
+   616→        # normalization and reshape
+   617→        # with amp.autocast(dtype=torch.float32):
+   618→        context_tokens = self.norm(context_tokens)
+   619→        context_tokens = rearrange(context_tokens, "(bz f) m c -> bz f m c", f=video_length)
+   620→
+   621→        return context_tokens
+   622→
+   623→
+   624→from torch.utils.checkpoint import checkpoint
+   625→
+   626→
+   627→class WanBlockOffloadManager:
+   628→    def __init__(self, blocks, onload_device, offload_device='cpu'):
+   629→        self.blocks = blocks
+   630→        self.onload_device = torch.device(onload_device)
+   631→        self.offload_device = torch.device(offload_device)
+   632→        self.prefetch_stream = torch.cuda.Stream(device=self.onload_device)
+   633→        self.compute_slot = 0
+   634→        self.prefetch_slot = 1
+   635→        self.pending_slots = set()
+   636→        self.slot_block_indices = [None, None]
+   637→        self.cuda_blocks = nn.ModuleList([
+   638→            copy.deepcopy(self.blocks[0]).to(self.onload_device),
+   639→            copy.deepcopy(self.blocks[0]).to(self.onload_device),
+   640→        ])
+   641→
+   642→        for block in self.blocks:
+   643→            block.to(self.offload_device)
+   644→            self._pin_module_memory(block)
+   645→
+   646→    def _copy_tensor(self, dst, src):
+   647→        dst.copy_(src, non_blocking=True)
+   648→
+   649→    def _pin_tensor(self, tensor):
+   650→        if tensor is None or tensor.device.type != 'cpu' or tensor.is_pinned():
+   651→            return tensor
+   652→        return tensor.pin_memory()
+   653→
+   654→    def _pin_module_memory(self, module):
+   655→        for name, param in module.named_parameters(recurse=False):
+   656→            if param is not None:
+   657→                param.data = self._pin_tensor(param.data)
+   658→
+   659→        for name, buffer in module.named_buffers(recurse=False):
+   660→            if buffer is not None:
+   661→                module._buffers[name] = self._pin_tensor(buffer)
+   662→
+   663→        if isinstance(module, (FP8Linear, FP4Linear)):
+   664→            module._fp16_weight_cpu = self._pin_tensor(module._fp16_weight_cpu)
+   665→            module._fp16_bias_cpu = self._pin_tensor(module._fp16_bias_cpu)
+   666→
+   667→        for child in module.children():
+   668→            self._pin_module_memory(child)
+   669→
+   670→    def _copy_fp8_linear(self, dst_module, src_module):
+   671→        if dst_module.linear is not None and src_module.linear is not None:
+   672→            self._copy_module_state(dst_module.linear, src_module.linear)
+   673→
+   674→        if dst_module.bias is not None and src_module.bias is not None:
+   675→            self._copy_tensor(dst_module.bias.data, src_module.bias.data)
+   676→
+   677→        dst_module._fp16_weight_cpu = src_module._fp16_weight_cpu
+   678→        dst_module._fp16_bias_cpu = src_module._fp16_bias_cpu
+   679→
+   680→        if src_module._fp8_weight is None or src_module._fp8_weight_scale is None:
+   681→            dst_module._fp8_weight = None
+   682→            dst_module._fp8_weight_scale = None
+   683→            dst_module._weight_cache_device = None
+   684→            if dst_module._fp16_weight_cpu is not None:
+   685→                dst_module.materialize_fp8_weight(self.onload_device)
+   686→        else:
+   687→            if dst_module._fp8_weight is None or dst_module._fp8_weight.shape != src_module._fp8_weight.shape:
+   688→                dst_module._fp8_weight = src_module._fp8_weight.to(device=self.onload_device, non_blocking=True)
+   689→            else:
+   690→                self._copy_tensor(dst_module._fp8_weight, src_module._fp8_weight)
+   691→
+   692→            if dst_module._fp8_weight_scale is None or dst_module._fp8_weight_scale.shape != src_module._fp8_weight_scale.shape:
+   693→                dst_module._fp8_weight_scale = src_module._fp8_weight_scale.to(device=self.onload_device,
+   694→                                                                               non_blocking=True)
+   695→            else:
+   696→                self._copy_tensor(dst_module._fp8_weight_scale, src_module._fp8_weight_scale)
+   697→            dst_module._weight_cache_device = dst_module._cached_fp8_device()
+   698→
+   699→        dst_module._last_weight_version = src_module._last_weight_version
+   700→
+   701→    def _copy_fp4_linear(self, dst_module, src_module):
+   702→        if dst_module.linear is not None and src_module.linear is not None:
+   703→            self._copy_module_state(dst_module.linear, src_module.linear)
+   704→
+   705→        if dst_module.bias is not None and src_module.bias is not None:
+   706→            self._copy_tensor(dst_module.bias.data, src_module.bias.data)
+   707→
+   708→        dst_module._fp16_weight_cpu = src_module._fp16_weight_cpu
+   709→        dst_module._fp16_bias_cpu = src_module._fp16_bias_cpu
+   710→
+   711→        if src_module._fp4_weight is None or src_module._fp4_weight_scale is None or src_module._w_global_scale is None:
+   712→            dst_module._fp4_weight = None
+   713→            dst_module._fp4_weight_scale = None
+   714→            dst_module._w_global_scale = None
+   715→            dst_module._weight_cache_device = None
+   716→            if dst_module._fp16_weight_cpu is not None:
+   717→                dst_module.materialize_fp4_weight(self.onload_device)
+   718→        else:
+   719→            if dst_module._fp4_weight is None or dst_module._fp4_weight.shape != src_module._fp4_weight.shape:
+   720→                dst_module._fp4_weight = src_module._fp4_weight.to(device=self.onload_device, non_blocking=True)
+   721→            else:
+   722→                self._copy_tensor(dst_module._fp4_weight, src_module._fp4_weight)
+   723→
+   724→            if dst_module._fp4_weight_scale is None or dst_module._fp4_weight_scale.shape != src_module._fp4_weight_scale.shape:
+   725→                dst_module._fp4_weight_scale = src_module._fp4_weight_scale.to(device=self.onload_device, non_blocking=True)
+   726→            else:
+   727→                self._copy_tensor(dst_module._fp4_weight_scale, src_module._fp4_weight_scale)
+   728→
+   729→            dst_module._w_global_scale = src_module._w_global_scale.to(device=self.onload_device, non_blocking=True)
+   730→            dst_module._weight_cache_device = dst_module._cached_fp4_device()
+   731→
+   732→        dst_module._last_weight_version = src_module._last_weight_version
+   733→
+   734→    def _copy_module_state(self, dst_module, src_module):
+   735→        if isinstance(dst_module, FP8Linear) and isinstance(src_module, FP8Linear):
+   736→            self._copy_fp8_linear(dst_module, src_module)
+   737→            return
+   738→        if isinstance(dst_module, FP4Linear) and isinstance(src_module, FP4Linear):
+   739→            self._copy_fp4_linear(dst_module, src_module)
+   740→            return
+   741→
+   742→        dst_params = dict(dst_module.named_parameters(recurse=False))
+   743→        src_params = dict(src_module.named_parameters(recurse=False))
+   744→        for name, dst_param in dst_params.items():
+   745→            src_param = src_params.get(name)
+   746→            if src_param is not None:
+   747→                self._copy_tensor(dst_param.data, src_param.data)
+   748→
+   749→        dst_buffers = dict(dst_module.named_buffers(recurse=False))
+   750→        src_buffers = dict(src_module.named_buffers(recurse=False))
+   751→        for name, dst_buffer in dst_buffers.items():
+   752→            src_buffer = src_buffers.get(name)
+   753→            if src_buffer is not None:
+   754→                self._copy_tensor(dst_buffer, src_buffer)
+   755→
+   756→        dst_children = dict(dst_module.named_children())
+   757→        src_children = dict(src_module.named_children())
+   758→        for name, dst_child in dst_children.items():
+   759→            src_child = src_children.get(name)
+   760→            if src_child is not None:
+   761→                self._copy_module_state(dst_child, src_child)
+   762→
+   763→    def _load_slot(self, slot_idx, block_idx, async_transfer=False):
+   764→        def copy_block():
+   765→            self._copy_module_state(self.cuda_blocks[slot_idx], self.blocks[block_idx])
+   766→            self.slot_block_indices[slot_idx] = block_idx
+   767→
+   768→        if async_transfer:
+   769→            with torch.cuda.stream(self.prefetch_stream):
+   770→                copy_block()
+   771→            self.pending_slots.add(slot_idx)
+   772→        else:
+   773→            copy_block()
+   774→            self.pending_slots.discard(slot_idx)
+   775→
+   776→    def _wait_slot(self, slot_idx):
+   777→        if slot_idx in self.pending_slots:
+   778→            torch.cuda.current_stream(device=self.onload_device).wait_stream(self.prefetch_stream)
+   779→            self.pending_slots.discard(slot_idx)
+   780→
+   781→    def get_block(self, block_idx):
+   782→        if self.slot_block_indices[self.compute_slot] == block_idx:
+   783→            self._wait_slot(self.compute_slot)
+   784→        elif self.slot_block_indices[self.prefetch_slot] == block_idx:
+   785→            self._wait_slot(self.prefetch_slot)
+   786→            self.compute_slot, self.prefetch_slot = self.prefetch_slot, self.compute_slot
+   787→        else:
+   788→            self._load_slot(self.compute_slot, block_idx, async_transfer=False)
+   789→
+   790→        next_idx = block_idx + 1
+   791→        if next_idx < len(self.blocks) and self.slot_block_indices[self.prefetch_slot] != next_idx:
+   792→            # We are about to overwrite self.prefetch_slot on the prefetch stream.
+   793→            # Must ensure the compute stream has finished using it from previous steps.
+   794→            self.prefetch_stream.wait_stream(torch.cuda.current_stream(device=self.onload_device))
+   795→            self._load_slot(self.prefetch_slot, next_idx, async_transfer=True)
+   796→
+   797→        return self.cuda_blocks[self.compute_slot]
+   798→
+   799→    def unload_all(self):
+   800→        torch.cuda.current_stream(device=self.onload_device).wait_stream(self.prefetch_stream)
+   801→        self.pending_slots.clear()
+   802→        self.slot_block_indices = [None, None]
+   803→
+   804→
+   805→class WanModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
+   806→    r"""
+   807→    Wan diffusion backbone supporting both text-to-video and image-to-video.
+   808→    """
+   809→
+   810→    ignore_for_config = [
+   811→        'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim', 'window_size'
+   812→    ]
+   813→    _no_split_modules = ['WanAttentionBlock']
+   814→
+   815→    @register_to_config
+   816→    def __init__(self,
+   817→                 model_type='i2v',
+   818→                 patch_size=(1, 2, 2),
+   819→                 text_len=512,
+   820→                 in_dim=16,
+   821→                 dim=2048,
+   822→                 ffn_dim=8192,
+   823→                 freq_dim=256,
+   824→                 text_dim=4096,
+   825→                 out_dim=16,
+   826→                 num_heads=16,
+   827→                 num_layers=32,
+   828→                 window_size=(-1, -1),
+   829→                 qk_norm=True,
+   830→                 cross_attn_norm=True,
+   831→                 eps=1e-6,
+   832→                 # audio params
+   833→                 audio_window=5,
+   834→                 intermediate_dim=512,
+   835→                 output_dim=768,
+   836→                 context_tokens=32,
+   837→                 vae_scale=4,  # vae timedownsample scale
+   838→
+   839→                 norm_input_visual=True,
+   840→                 norm_output_audio=True,
+   841→                 weight_init=True):
+   842→        super().__init__()
+   843→
+   844→        assert model_type == 'i2v', 'MultiTalk model requires your model_type is i2v.'
+   845→        self.model_type = model_type
+   846→
+   847→        self.patch_size = patch_size
+   848→        self.text_len = text_len
+   849→        self.in_dim = in_dim
+   850→        self.dim = dim
+   851→        self.ffn_dim = ffn_dim
+   852→        self.freq_dim = freq_dim
+   853→        self.text_dim = text_dim
+   854→        self.out_dim = out_dim
+   855→        self.num_heads = num_heads
+   856→        self.num_layers = num_layers
+   857→        self.window_size = window_size
+   858→        self.qk_norm = qk_norm
+   859→        self.cross_attn_norm = cross_attn_norm
+   860→        self.eps = eps
+   861→        self.gradient_checkpointing = False
+   862→
+   863→        self.norm_output_audio = norm_output_audio
+   864→        self.audio_window = audio_window
+   865→        self.intermediate_dim = intermediate_dim
+   866→        self.vae_scale = vae_scale
+   867→
+   868→        self.return_layers_cosine = False
+   869→        self.cos_sims = []
+   870→        self.skip_layer = []
+   871→        self.block_offload_manager = None
+   872→        self.block_offload_enabled = False
+   873→
+   874→        # embeddings
+   875→        self.patch_embedding = nn.Conv3d(
+   876→            in_dim, dim, kernel_size=patch_size, stride=patch_size)
+   877→        self.text_embedding = nn.Sequential(
+   878→            nn.Linear(text_dim, dim), nn.GELU(approximate='tanh'),
+   879→            nn.Linear(dim, dim))
+   880→
+   881→        self.time_embedding = nn.Sequential(
+   882→            nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+   883→        self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+   884→
+   885→        # blocks
+   886→        cross_attn_type = 'i2v_cross_attn'
+   887→        self.blocks = nn.ModuleList([
+   888→            WanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
+   889→                              window_size, qk_norm, cross_attn_norm, eps,
+   890→                              output_dim=output_dim, norm_input_visual=norm_input_visual)
+   891→            for _ in range(num_layers)
+   892→        ])
+   893→
+   894→        # head
+   895→        self.head = Head(dim, out_dim, patch_size, eps)
+   896→
+   897→        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
+   898→        d = dim // num_heads
+   899→        self.freqs = torch.cat([
+   900→            rope_params(1024, d - 4 * (d // 6)),
+   901→            rope_params(1024, 2 * (d // 6)),
+   902→            rope_params(1024, 2 * (d // 6))
+   903→        ],
+   904→            dim=1)
+   905→
+   906→        if model_type == 'i2v':
+   907→            self.img_emb = MLPProj(1280, dim)
+   908→        else:
+   909→            raise NotImplementedError('Not supported model type.')
+   910→
+   911→        # init audio adapter
+   912→        self.audio_proj = AudioProjModel(
+   913→            seq_len=audio_window,
+   914→            seq_len_vf=audio_window + vae_scale - 1,
+   915→            intermediate_dim=intermediate_dim,
+   916→            output_dim=output_dim,
+   917→            context_tokens=context_tokens,
+   918→            norm_output_audio=norm_output_audio,
+   919→        )
+   920→
+   921→        # initialize weights
+   922→        if weight_init:
+   923→            self.init_weights()
+   924→
+   925→    def init_freqs(self):
+   926→        d = self.dim // self.num_heads
+   927→        self.freqs = torch.cat([
+   928→            rope_params(1024, d - 4 * (d // 6)),
+   929→            rope_params(1024, 2 * (d // 6)),
+   930→            rope_params(1024, 2 * (d // 6))
+   931→        ],
+   932→            dim=1)
+   933→
+   934→    def enable_block_offload(self, onload_device=None, offload_device='cpu'):
+   935→        if onload_device is None:
+   936→            onload_device = self.patch_embedding.weight.device
+   937→        onload_device = torch.device(onload_device)
+   938→        if onload_device.type != 'cuda':
+   939→            raise ValueError("WanModel block offload requires a CUDA onload device.")
+   940→
+   941→        self.block_offload_manager = WanBlockOffloadManager(
+   942→            self.blocks,
+   943→            onload_device=onload_device,
+   944→            offload_device=offload_device,
+   945→        )
+   946→        self.block_offload_enabled = True
+   947→        torch.cuda.empty_cache()
+   948→        return self
+   949→
+   950→    def disable_block_offload(self):
+   951→        if self.block_offload_manager is not None:
+   952→            self.block_offload_manager.unload_all()
+   953→            for block in self.blocks:
+   954→                block.to(self.patch_embedding.weight.device)
+   955→            self.block_offload_manager = None
+   956→        self.block_offload_enabled = False
+   957→        return self
+   958→
+   959→    def forward(
+   960→            self,
+   961→            x,
+   962→            t,
+   963→            context,
+   964→            seq_len=None,
+   965→            clip_fea=None,
+   966→            y=None,
+   967→            audio=None,
+   968→            ref_target_masks=None,
+   969→            e0=None,
+   970→            kv_cache={},
+   971→            start_idx=None,
+   972→            end_idx=None,
+   973→            cross_kv_cache={},
+   974→            update_cache=True,
+   975→            skip_audio=False,
+   976→    ):
+   977→        assert clip_fea is not None and y is not None
+   978→
+   979→        _, T, H, W = x[0].shape
+   980→        N_t = T // self.patch_size[0]
+   981→        N_h = H // self.patch_size[1]
+   982→        N_w = W // self.patch_size[2]
+   983→
+   984→        if y is not None:
+   985→            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+   986→        x[0] = x[0].to(context[0].dtype)
+   987→
+   988→        # embeddings
+   989→        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+   990→        grid_sizes = torch.stack(
+   991→            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+   992→        x = [u.flatten(2).transpose(1, 2) for u in x]
+   993→        seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
+   994→        x = torch.cat(x)
+   995→
+   996→        # time embeddings
+   997→        if e0 is None:
+   998→            # with amp.autocast(dtype=torch.float32):
+   999→            e = self.time_embedding(
+  1000→                sinusoidal_embedding_1d(self.freq_dim, t).float())
+  1001→            e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+  1002→            # assert e.dtype == torch.float32 and e0.dtype == torch.float32
+  1003→        else:
+  1004→            # with amp.autocast(dtype=torch.float32):
+  1005→            e = self.time_embedding(
+  1006→                sinusoidal_embedding_1d(self.freq_dim, t).float())
+  1007→
+  1008→        # text embedding
+  1009→        context_lens = None
+  1010→        context = self.text_embedding(
+  1011→            torch.stack([
+  1012→                torch.cat(
+  1013→                    [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
+  1014→                for u in context
+  1015→            ]))
+  1016→
+  1017→        # clip embedding
+  1018→        if clip_fea is not None:
+  1019→            context_clip = self.img_emb(clip_fea)
+  1020→            context = torch.concat([context_clip, context], dim=1).to(x.dtype)
+  1021→
+  1022→        audio_cond = audio.to(device=x.device, dtype=x.dtype)
+  1023→        first_frame_audio_emb_s = audio_cond[:, :1, ...]
+  1024→        latter_frame_audio_emb = audio_cond[:, 1:, ...]
+  1025→        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale)
+  1026→        middle_index = self.audio_window // 2
+  1027→        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index + 1, ...]
+  1028→        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+  1029→        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+  1030→        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+  1031→        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index + 1, ...]
+  1032→        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+  1033→        latter_frame_audio_emb_s = torch.concat(
+  1034→            [latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+  1035→        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+  1036→        human_num = len(audio_embedding)
+  1037→        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
+  1038→
+  1039→        # convert ref_target_masks to token_ref_target_masks
+  1040→        if ref_target_masks is not None:
+  1041→            ref_target_masks = ref_target_masks.unsqueeze(0)  # .to(torch.float32)
+  1042→            token_ref_target_masks = nn.functional.interpolate(ref_target_masks, size=(N_h, N_w), mode='nearest')
+  1043→            token_ref_target_masks = token_ref_target_masks.squeeze(0)
+  1044→            token_ref_target_masks = (token_ref_target_masks > 0)
+  1045→            token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1)
+  1046→            token_ref_target_masks = token_ref_target_masks.to(x.dtype)
+  1047→
+  1048→        # arguments
+  1049→        kwargs = dict(
+  1050→            e=e0,
+  1051→            seq_lens=seq_lens,
+  1052→            grid_sizes=grid_sizes,
+  1053→            freqs=self.freqs,
+  1054→            context=context,
+  1055→            context_lens=context_lens,
+  1056→            audio_embedding=audio_embedding,
+  1057→            ref_target_masks=token_ref_target_masks,
+  1058→            human_num=human_num,
+  1059→            start_idx=start_idx,
+  1060→            end_idx=end_idx,
+  1061→            update_cache=update_cache,
+  1062→            skip_audio=skip_audio,
+  1063→        )
+  1064→
+  1065→        block_offload_manager = self.block_offload_manager if self.block_offload_enabled else None
+  1066→        if torch.is_grad_enabled() and self.gradient_checkpointing:
+  1067→            for block_index, block in enumerate(self.blocks):
+  1068→                if block_offload_manager is not None:
+  1069→                    block = block_offload_manager.get_block(block_index)
+  1070→                if kv_cache.get(block_index) is None: kv_cache[block_index] = {}
+  1071→                if cross_kv_cache.get(block_index) is None: cross_kv_cache[block_index] = {}
+  1072→                x = checkpoint(
+  1073→                    block, x, kv_cache=kv_cache[block_index], cross_kv_cache=cross_kv_cache[block_index],
+  1074→                    use_reentrant=False, **kwargs
+  1075→                )
+  1076→        else:
+  1077→            for block_index, block in enumerate(self.blocks):
+  1078→                if block_offload_manager is not None:
+  1079→                    block = block_offload_manager.get_block(block_index)
+  1080→                if kv_cache.get(block_index) is None: kv_cache[block_index] = {}
+  1081→                if cross_kv_cache.get(block_index) is None: cross_kv_cache[block_index] = {}
+  1082→                x = block(x, kv_cache=kv_cache[block_index], cross_kv_cache=cross_kv_cache[block_index], **kwargs)
+  1083→
+  1084→        # head
+  1085→        x = self.head(x, e)
+  1086→
+  1087→        # unpatchify
+  1088→        x = self.unpatchify(x, grid_sizes)
+  1089→
+  1090→        return torch.stack(x)  # .float()
+  1091→
+  1092→    def unpatchify(self, x, grid_sizes):
+  1093→        r"""
+  1094→        Reconstruct video tensors from patch embeddings.
+  1095→
+  1096→        Args:
+  1097→            x (List[Tensor]):
+  1098→                List of patchified features, each with shape [L, C_out * prod(patch_size)]
+  1099→            grid_sizes (Tensor):
+  1100→                Original spatial-temporal grid dimensions before patching,
+  1101→                    shape [B, 3] (3 dimensions correspond to F_patches, H_patches, W_patches)
+  1102→
+  1103→        Returns:
+  1104→            List[Tensor]:
+  1105→                Reconstructed video tensors with shape [C_out, F, H / 8, W / 8]
+  1106→        """
+  1107→
+  1108→        c = self.out_dim
+  1109→        out = []
+  1110→        for u, v in zip(x, grid_sizes.tolist()):
+  1111→            u = u[:math.prod(v)].view(*v, *self.patch_size, c)
+  1112→            u = torch.einsum('fhwpqrc->cfphqwr', u)
+  1113→            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+  1114→            out.append(u)
+  1115→        return out
+  1116→
+  1117→    def init_weights(self):
+  1118→        r"""
+  1119→        Initialize model parameters using Xavier initialization.
+  1120→        """
+  1121→
+  1122→        # basic init
+  1123→        for m in self.modules():
+  1124→            if isinstance(m, nn.Linear):
+  1125→                nn.init.xavier_uniform_(m.weight)
+  1126→                if m.bias is not None:
+  1127→                    nn.init.zeros_(m.bias)
+  1128→
+  1129→        # init embeddings
+  1130→        nn.init.xavier_uniform_(self.patch_embedding.weight.flatten(1))
+  1131→        for m in self.text_embedding.modules():
+  1132→            if isinstance(m, nn.Linear):
+  1133→                nn.init.normal_(m.weight, std=.02)
+  1134→        for m in self.time_embedding.modules():
+  1135→            if isinstance(m, nn.Linear):
+  1136→                nn.init.normal_(m.weight, std=.02)
+  1137→
+  1138→        # init output layer
+  1139→        nn.init.zeros_(self.head.head.weight)
