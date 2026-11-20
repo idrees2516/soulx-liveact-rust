@@ -313,6 +313,11 @@ fn handle_event(lab: LabRef, line: &str) {
             }
             l.n_frames = l.frames.last().map(|(f, _)| f + 1).unwrap_or(0);
             draw_at(&l, l.n_frames.saturating_sub(1));
+            let play = dom::get("ml_play")
+                .dyn_into::<web_sys::HtmlButtonElement>()
+                .unwrap_throw();
+            play.set_disabled(false);
+            play.style().set_property("opacity", "1").ok();
             if let Some(slider) = dom::document().get_element_by_id("ml_frame") {
                 let s = slider.dyn_into::<web_sys::HtmlInputElement>().unwrap_throw();
                 s.set_max(&(l.n_frames as f64 - 1.0).to_string());
