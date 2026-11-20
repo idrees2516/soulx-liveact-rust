@@ -1,0 +1,27 @@
+[package]
+name = "liveact-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+liveact-proto = { path = "../proto" }
+liveact-model = { path = "../model" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+    "net",
+] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ort = { version = "=2.0.0-rc.11" }
+include_dir = "0.7"
+
+[dev-dependencies]
+hound = "3.5"

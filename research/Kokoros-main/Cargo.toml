@@ -1,3 +1,0 @@
-[workspace]
-members = ["koko", "kokoros", "kokoros-openai"]
-resolver = "2"
